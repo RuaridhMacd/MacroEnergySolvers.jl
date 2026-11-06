@@ -93,6 +93,6 @@
         @constraint(b, y <= x)
         @objective(b, Min, y)
         MES.add_slacks_to_subproblem!(b)
-        @test_throws ErrorException MES.solve_subproblem(b, (values = Dict("x" => 0.0),), ["x"], false)
+        @test_throws MES.BendersSubproblemSolveError MES.solve_subproblem(b, (values = Dict("x" => 0.0),), ["x"], false)
     end
 end

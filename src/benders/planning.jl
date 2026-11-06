@@ -16,30 +16,73 @@ A NamedTuple containing:
 - `values`: Dictionary mapping linking variable names to their optimal values
 
 # Notes
-If negative capacities are detected, the solver will be reconfigured with `Crossover = 1` 
-and the problem will be re-solved. If the solution fails, the function will compute
-and display conflicting constraints (if the solver supports it) before throwing an error.
+Only an optimal feasible solve supplies a lower bound. Solver-specific recovery
+may retry a continuous affine master after a numerical failure. Infeasibility
+triggers conflict diagnostics when supported; other unresolved failures raise
+`BendersPlanningSolveError` so the algorithm can retain an existing incumbent.
 """
+function retry_planning_problem!(m::Model, planning_variables::Vector{String})
+    termination_status(m) in (SLOW_PROGRESS, NUMERICAL_ERROR, DUAL_INFEASIBLE, INFEASIBLE_OR_UNBOUNDED) || return nothing
+    # The simplex fallback is appropriate only for a continuous, affine master.
+    any(v -> is_integer(v) || is_binary(v), all_variables(m)) && return nothing
+    objective_function(m) isa AffExpr || return nothing
+    all(F in (VariableRef, AffExpr) for (F, _) in list_of_constraint_types(m)) || return nothing
+    variants = benders_planning_retry_variants(unsafe_backend(m))
+    isempty(variants) && return nothing
+    original_attributes = Dict{String,Any}()
+    try
+        for attributes in variants
+            @warn "Retrying numerical master LP solve; accuracy limits unchanged" attributes
+            for (key,val) in attributes
+                haskey(original_attributes,key) || (original_attributes[key] = get_optimizer_attribute(m,key))
+                set_optimizer_attribute(m,key,val)
+            end
+            optimize!(m)
+            if termination_status(m) == OPTIMAL && solved_and_feasible(m)
+                # Restoring raw optimizer attributes can invalidate JuMP's cached
+                # result status. Capture the accepted solution before restoration.
+                return process_planning_sol(m, planning_variables), objective_value(m)
+            end
+        end
+        throw(BendersPlanningSolveError("Planning recovery failed; no new lower bound was accepted. " * subproblem_status_summary(m)))
+    finally
+        for (key,val) in original_attributes
+            set_optimizer_attribute(m,key,val)
+        end
+    end
+    return nothing
+end
+
 function solve_planning_problem(m::Model,planning_variables::Vector{String})
 	
 	
     optimize!(m)
+    if !(termination_status(m) == OPTIMAL && solved_and_feasible(m))
+        recovered = retry_planning_problem!(m, planning_variables)
+        isnothing(recovered) || return recovered
+    end
 
-    if solved_and_feasible(m)
+    if termination_status(m) == OPTIMAL && solved_and_feasible(m)
         planning_sol = process_planning_sol(m,planning_variables)
         LB = objective_value(m)
     else
-        compute_conflict!(m)
-        list_of_conflicting_constraints = ConstraintRef[];
-        for (F, S) in list_of_constraint_types(m)
-            for con in all_constraints(m, F, S)
-                if get_attribute(con, MOI.ConstraintConflictStatus()) == MOI.IN_CONFLICT
-                    push!(list_of_conflicting_constraints, con)
+        if termination_status(m) == INFEASIBLE
+            try
+                compute_conflict!(m)
+                list_of_conflicting_constraints = ConstraintRef[]
+                for (F, S) in list_of_constraint_types(m), con in all_constraints(m, F, S)
+                    if get_attribute(con, MOI.ConstraintConflictStatus()) == MOI.IN_CONFLICT
+                        push!(list_of_conflicting_constraints, con)
+                    end
                 end
+                display(list_of_conflicting_constraints)
+            catch err
+                @warn "Planning conflict diagnostics unavailable" reason=sprint(showerror, err)
             end
         end
-        display(list_of_conflicting_constraints)
-        error("The planning solution failed. This should not happen.")
+        message = "Planning problem did not return an optimal feasible solution; no new lower bound was accepted. " * subproblem_status_summary(m)
+        termination_status(m) == INFEASIBLE && error(message)
+        throw(BendersPlanningSolveError(message))
     end
 
     return planning_sol, LB

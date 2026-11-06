@@ -70,9 +70,13 @@ function benders(planning_problem::Model,subproblems::Union{Vector{Dict{Any, Any
     #### Algorithm parameters:
 	MaxIter = setup[:MaxIter];
     ConvTol = setup[:ConvTol];
+    gap_floor = get(setup, :GapDenominatorFloor, 1.0)
+    gap_floor isa Real && isfinite(gap_floor) && gap_floor > 0 ||
+        throw(ArgumentError("GapDenominatorFloor must be finite and positive"))
 	MaxCpuTime = setup[:MaxCpuTime];
 	γ = setup[:StabParam];
 	term_status = "NONE";
+    failure_message = nothing
 
 	stab_dynamic = setup[:StabDynamic];
 
@@ -101,6 +105,23 @@ function benders(planning_problem::Model,subproblems::Union{Vector{Dict{Any, Any
     #### Initialize UB and LB
 	planning_sol, LB = solve_planning_problem(planning_problem,planning_variables);
 
+    initial_values = get(setup, :InitialPlanningSolution, nothing)
+    if !isnothing(initial_values)
+        candidate = copy(planning_sol.values)
+        for (key, val) in pairs(initial_values)
+            variable_name = String(key)
+            haskey(candidate, variable_name) || error("Unknown initial planning variable: $variable_name")
+            isfinite(val) || error("Non-finite initial planning value for $variable_name")
+            candidate[variable_name] = Float64(val)
+        end
+        point = Dict(v => candidate[name(v)] for v in all_variables(planning_problem))
+        violations = primal_feasibility_report(planning_problem, point; atol=1e-5)
+        isempty(violations) || error("Initial planning solution violates master constraints at tolerance 1e-5")
+        planning_sol = (planning_cost=value(v -> candidate[name(v)], planning_problem[:ePlanningCost]),
+                        values=candidate)
+        @info "Evaluating supplied initial plan; unrestricted master lower bound is unchanged" LB
+    end
+
     UB = Inf;
 
     LB_hist = Float64[];
@@ -120,7 +141,20 @@ function benders(planning_problem::Model,subproblems::Union{Vector{Dict{Any, Any
 
 		planning_sol_hist = hcat(planning_sol_hist, [planning_sol.values[s] for s in planning_variables])
 		
-        subop_sol = solve_subproblems(subproblems,planning_sol,expect_feasible_subproblems);
+        subop_sol = try
+            solve_subproblems(subproblems,planning_sol,expect_feasible_subproblems)
+        catch err
+            if err isa BendersSubproblemSolveError && isfinite(UB) && !isempty(subop_sol_best)
+                term_status = "SUBPROBLEM_NUMERICAL_FAILURE"
+                failure_message = sprint(showerror,err)
+                push!(LB_hist,LB); push!(UB_hist,UB)
+                push!(gap_hist,abs(UB-LB)/max(abs(UB),abs(LB),gap_floor))
+                push!(cpu_time,time()-solver_start_time)
+                @warn "Stopping Benders with a retained feasible incumbent; the requested gap was not reached" LB UB failure_message
+                break
+            end
+            rethrow()
+        end
         
 		cpu_subop_sol = time()-start_subop_sol;
 		@info("Solving the subproblems required $(tidy_timing(cpu_subop_sol)) seconds")
@@ -142,7 +176,20 @@ function benders(planning_problem::Model,subproblems::Union{Vector{Dict{Any, Any
 
 		start_planning_sol = time()
 
-		unst_planning_sol, LBnew = solve_planning_problem(planning_problem,planning_variables);
+        unst_planning_sol, LBnew = try
+            solve_planning_problem(planning_problem,planning_variables)
+        catch err
+            if err isa BendersPlanningSolveError && isfinite(UB) && !isempty(subop_sol_best)
+                term_status = "MASTER_NUMERICAL_FAILURE"
+                failure_message = sprint(showerror,err)
+                push!(LB_hist,LB); push!(UB_hist,UB)
+                push!(gap_hist,abs(UB-LB)/max(abs(UB),abs(LB),gap_floor))
+                push!(cpu_time,time()-solver_start_time)
+                @warn "Stopping Benders after master recovery failed; retaining the incumbent and last valid lower bound" LB UB failure_message
+                break
+            end
+            rethrow()
+        end
 
 		cpu_planning_sol = time()-start_planning_sol;
 		@info("Solving the planning problem required $(tidy_timing(cpu_planning_sol)) seconds")
@@ -150,7 +197,7 @@ function benders(planning_problem::Model,subproblems::Union{Vector{Dict{Any, Any
 		LB = max(LB,LBnew);
 		@info("The optimal value of the planning problem is $LBnew")
 		
-		running_gap = (UB-LB)/abs(LB)
+		running_gap = isfinite(UB) ? abs(UB-LB) / maximum([abs(UB), abs(LB), gap_floor]) : Inf
 
 		append!(LB_hist,LB)
         append!(UB_hist,UB)
@@ -241,7 +288,7 @@ function benders(planning_problem::Model,subproblems::Union{Vector{Dict{Any, Any
 		set_logger(old_logger)
 	end
 	
-	return (planning_problem=planning_problem,planning_sol = planning_sol_best, subop_sol = subop_sol_best,LB_hist = LB_hist,UB_hist = UB_hist,gap_hist = gap_hist, termination_status = term_status, cpu_time = cpu_time, planning_sol_hist = planning_sol_hist)
+	return (planning_problem=planning_problem,planning_sol = planning_sol_best, subop_sol = subop_sol_best,LB_hist = LB_hist,UB_hist = UB_hist,gap_hist = gap_hist, termination_status = term_status, cpu_time = cpu_time, planning_sol_hist = planning_sol_hist, failure_message=failure_message)
 	
 end
 
@@ -249,7 +296,7 @@ function update_planning_problem_multi_cuts!(m::Model,subop_sol::Dict,planning_s
     
 	W = keys(subop_sol);
 	
-    @constraint(m,[w in W],subop_sol[w].theta_coeff*m[:vTHETA][w] >= subop_sol[w].op_cost + sum(subop_sol[w].lambda[i]*(variable_by_name(m,linking_variables_sub[w][i]) - planning_sol.values[linking_variables_sub[w][i]]) for i in 1:length(linking_variables_sub[w])));
+    @constraint(m,[w in W],subop_sol[w].theta_coeff*m[:vTHETA][w] >= get(subop_sol[w], :cut_cost, subop_sol[w].op_cost) + sum(subop_sol[w].lambda[i]*(variable_by_name(m,linking_variables_sub[w][i]) - planning_sol.values[linking_variables_sub[w][i]]) for i in 1:length(linking_variables_sub[w])));
 
 end
 

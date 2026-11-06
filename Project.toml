@@ -18,10 +18,19 @@ HiGHS = "1"
 Distributed = "1"
 DistributedArrays = "0.6"
 JuMP = "1"
+Mosek = "11"
+MosekTools = "0.15"
 Logging = "1"
 Pkg = "1"
 Test = "1"
 julia = "1.9"
+
+[weakdeps]
+Mosek = "6405355b-0ac2-5fba-af84-adbd65488c0e"
+MosekTools = "1ec41992-ff65-5c91-ac43-2df89e9693a4"
+
+[extensions]
+MacroEnergySolversMosekExt = ["Mosek", "MosekTools"]
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
