@@ -71,6 +71,10 @@ A later `BendersSubproblemSolveError` returns the last verified incumbent and
 bounds with status `SUBPROBLEM_NUMERICAL_FAILURE` if an incumbent exists. The
 failed candidate supplies no cut or upper bound. Without an incumbent the error
 still propagates; programming/configuration exceptions are not swallowed.
+Distributed solves preserve this numerical-failure classification when returning
+from a worker, so incumbent retention is the same as in sequential execution.
+Distributed solving and feasibility-slack initialization target the model's
+owning processes rather than every Julia worker in the session.
 An `INFEASIBLE` operational solve triggers feasibility recovery (when
 `ExpectFeasibleSubproblems=false`). The MOSEK extension also permits recovery
 after `SLOW_PROGRESS` if both the native solution status and JuMP's dual status

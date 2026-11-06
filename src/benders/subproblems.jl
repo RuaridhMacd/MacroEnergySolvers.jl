@@ -8,7 +8,7 @@ end
 
 function add_slacks_to_subproblems!(m_subproblems::DArray{Dict{Any, Any}, 1, Vector{Dict{Any, Any}}})
 
-    @sync for p in workers()
+    @sync for p in procs(m_subproblems)
         @async @spawnat p begin
             add_slacks_to_local_subproblems!(localpart(m_subproblems));
         end
@@ -263,16 +263,28 @@ and merged into a single dictionary containing all subproblem solutions.
 """
 function solve_subproblems(m_subproblems::DArray{Dict{Any, Any}, 1, Vector{Dict{Any, Any}}},planning_sol::NamedTuple,expect_feasible_subproblems::Bool)
 
-    p_id = workers();
+    p_id = procs(m_subproblems);
     np_id = length(p_id);
 
-    sub_results = [Dict() for k in 1:np_id];
+    sub_results = Vector{Any}(undef, np_id);
 
     @sync for k in 1:np_id
-              @async sub_results[k]= @fetchfrom p_id[k] solve_local_subproblems(localpart(m_subproblems),planning_sol,expect_feasible_subproblems); ### This is equivalent to fetch(@spawnat p .....)
+        @async sub_results[k] = @fetchfrom p_id[k] begin
+            try
+                (solution=solve_local_subproblems(localpart(m_subproblems),planning_sol,expect_feasible_subproblems), failure=nothing)
+            catch err
+                # Return the known numerical failure explicitly so it retains its
+                # type on the master, rather than being hidden in RemoteException.
+                err isa BendersSubproblemSolveError || rethrow()
+                (solution=nothing, failure=sprint(showerror,err))
+            end
+        end
     end
 
-	sub_results = merge(sub_results...);
+    for result in sub_results
+        isnothing(result.failure) || throw(BendersSubproblemSolveError(result.failure))
+    end
+    sub_results = merge((result.solution for result in sub_results)...);
 
     return sub_results
 end

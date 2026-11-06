@@ -12,6 +12,7 @@ const MES = MacroEnergySolvers
     include("infeasible_solve_detection.jl")
     include("subproblem_status_handling.jl")
     include("initial_planning_solution.jl")
+    include("distributed_subproblems.jl")
     @testset "Code quality (Aqua.jl)" begin
         Aqua.test_all(MacroEnergySolvers)
     end
