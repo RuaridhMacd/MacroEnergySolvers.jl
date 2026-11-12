@@ -72,6 +72,15 @@ function add_slacks_to_subproblem!(subproblem::Model)
     return nothing
 end
 
+# Chain model-restoring steps (objective, slacks, optimizer attributes) to run at the start of the
+# next solve. Restoring immediately would invalidate the solution of the retry or Phase I solve
+# before its duals and values are read.
+function defer_restore!(m::Model, f)
+    prev = get(m.ext, :MacroEnergySolversDeferredRestore, nothing)
+    m.ext[:MacroEnergySolversDeferredRestore] = isnothing(prev) ? f : () -> (prev(); f())
+    return nothing
+end
+
 function fix_linking_variables!(m::Model,planning_sol::NamedTuple,linking_variables_sub::Vector{String})
     ### Fix linking variables in the subproblem to the values computed by the planning problem. 
 	for y in linking_variables_sub
@@ -118,8 +127,12 @@ function recover_operation_after_zero_slack!(m::Model, linking::Vector{String}, 
         cost, lambda = benders_cut_values(m, linking, context)
         return (op_cost=cost, lambda=lambda, theta_coeff=1, cut_cost=benders_cut_intercept(m,cost))
     finally
-        for (key,val) in original_attributes
-            set_optimizer_attribute(m,key,val)
+        if !isempty(original_attributes)
+            defer_restore!(m, () -> begin
+                for (key,val) in original_attributes
+                    set_optimizer_attribute(m,key,val)
+                end
+            end)
         end
         delete!(m.ext, retry_key)
     end
@@ -131,6 +144,9 @@ function solve_subproblem(m::Model,planning_sol::NamedTuple,linking_variables_su
 
     isfinite(feasibility_tolerance) && feasibility_tolerance >= 0 ||
         throw(ArgumentError("feasibility_tolerance must be finite and nonnegative"))
+	# Apply any restore steps deferred from the previous solve.
+	restore_deferred = pop!(m.ext, :MacroEnergySolversDeferredRestore, nothing)
+	isnothing(restore_deferred) || restore_deferred()
 	fix_linking_variables!(m,planning_sol,linking_variables_sub)
 
 	optimize!(m)
@@ -149,7 +165,7 @@ function solve_subproblem(m::Model,planning_sol::NamedTuple,linking_variables_su
             return recover_operation_after_zero_slack!(m, linking_variables_sub, original_objective;
                 resolve=false, context="Operational retry")
         finally
-            set_objective_function(m, original_objective)
+            defer_restore!(m, () -> set_objective_function(m, original_objective))
         end
     end
 
@@ -208,9 +224,11 @@ function solve_subproblem(m::Model,planning_sol::NamedTuple,linking_variables_su
         else
             m.ext[scale_key] = previous_scale
         end
-        fix(m[:slack_max], 0.0; force=true)
-        set_objective_sense(m, objsense)
-        set_objective_function(m, objfun)
+        defer_restore!(m, () -> begin
+            fix(m[:slack_max], 0.0; force=true)
+            set_objective_sense(m, objsense)
+            set_objective_function(m, objfun)
+        end)
     end
 
 end

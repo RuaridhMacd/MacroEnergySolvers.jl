@@ -117,14 +117,19 @@ function subproblem_reported_infeasible(m::Model)
            benders_native_infeasible(unsafe_backend(m))
 end
 
+# Stalled solves are accepted only if they pass these gates. The defaults are strict; they can be
+# relaxed per run with the environment variables BENDERS_PRIMAL_GATE, BENDERS_DUAL_GATE and
+# BENDERS_GAP_GATE (the gap gate is relative to 1 + |objective|).
+stall_gate(name::String, default::Float64) = parse(Float64, get(ENV, name, string(default)))
+
 function acceptable_stalled_quality(q)
     isnothing(q) && return false
     q.native_optimal || return false
     metrics = (q.primal_objective, q.dual_objective, q.primal_violation, q.dual_violation)
     all(isfinite, metrics) || return false
-    0 <= q.primal_violation <= 1e-6 || return false
-    0 <= q.dual_violation <= 1e-6 || return false
-    gap_tolerance = 1e-8 * (1 + max(abs(q.primal_objective), abs(q.dual_objective)))
+    0 <= q.primal_violation <= stall_gate("BENDERS_PRIMAL_GATE", 1e-6) || return false
+    0 <= q.dual_violation <= stall_gate("BENDERS_DUAL_GATE", 1e-6) || return false
+    gap_tolerance = stall_gate("BENDERS_GAP_GATE", 1e-8) * (1 + max(abs(q.primal_objective), abs(q.dual_objective)))
     return abs(q.primal_objective - q.dual_objective) <= gap_tolerance
 end
 
